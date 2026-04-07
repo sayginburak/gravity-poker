@@ -16,9 +16,13 @@
   }
   #game-root {
     width: 100vw;
-    height: 100vh;
+    height: 100dvh;
+    height: 100vh; /* fallback for older browsers, overridden by dvh where supported */
     display: grid;
     place-items: center;
+  }
+  @supports (height: 100dvh) {
+    #game-root { height: 100dvh; }
   }
   canvas {
     display: block;
@@ -181,15 +185,24 @@ class GameScene extends Phaser.Scene {
     this.handsLeft = STARTING_HANDS;
     this.busy = false;
 
-    const gridW = GRID_COLS * (CARD_W + CARD_GAP) - CARD_GAP;
-    const gridH = GRID_ROWS * (CARD_H + CARD_GAP) - CARD_GAP;
+    // ---- Responsive layout (bottom-up) --------------------------------
+    // Reserve fixed space for header (60px) and footer (button + labels = 110px).
+    // Scale card size to fill the remaining vertical space.
+    const headerH = 64;
+    const footerH = 110;
+    const availableH = height - headerH - footerH;
+    const naturalGridH = GRID_ROWS * (CARD_H + CARD_GAP) - CARD_GAP;
+    const naturalGridW = GRID_COLS * (CARD_W + CARD_GAP) - CARD_GAP;
+    const scaleFactor = Math.min(1, availableH / naturalGridH, (width - 16) / naturalGridW);
+
+    this.cardW = Math.floor(CARD_W * scaleFactor);
+    this.cardH = Math.floor(CARD_H * scaleFactor);
+    this.cardGap = Math.floor(CARD_GAP * scaleFactor);
+
+    const gridW = GRID_COLS * (this.cardW + this.cardGap) - this.cardGap;
+    const gridH = GRID_ROWS * (this.cardH + this.cardGap) - this.cardGap;
     this.gridX = (width - gridW) / 2;
-    // Keep gameplay vertically centered-ish while guaranteeing controls are visible.
-    // Required vertical space below grid:
-    // handType gap (24) + button gap (68) + button half-height (22) + bottom padding (10).
-    const requiredBelowGrid = 124;
-    const maxGridYForFit = height - gridH - requiredBelowGrid;
-    this.gridY = Math.max(80, Math.min(110, maxGridYForFit));
+    this.gridY = headerH;
 
     for (let r = 0; r < GRID_ROWS; r++) {
       this.grid[r] = [];
@@ -200,19 +213,9 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // ---- UI ---------------------------------------------------------
+    // ---- UI (positioned bottom-up from canvas edge) -----------------
 
-    const panelY = this.gridY + gridH + 24;
-
-    this.handTypeText = this.add.text(width / 2, panelY, '', {
-      fontSize: '22px', fontFamily: 'monospace', color: '#f1c40f', fontStyle: 'bold'
-    }).setOrigin(0.5);
-
-    this.chipsPreview = this.add.text(width / 2, panelY + 28, '', {
-      fontSize: '15px', fontFamily: 'monospace', color: '#bdc3c7'
-    }).setOrigin(0.5);
-
-    const btnY = panelY + 68;
+    const btnY = height - 30;
     this.playBtn = this.add.rectangle(width / 2, btnY, 180, 44, 0x9b59b6, 1)
       .setInteractive({ useHandCursor: true })
       .on('pointerdown', () => this.onPlayHand())
@@ -222,22 +225,26 @@ class GameScene extends Phaser.Scene {
       fontSize: '18px', fontFamily: 'monospace', color: '#fff', fontStyle: 'bold'
     }).setOrigin(0.5);
 
-    this.scoreText = this.add.text(16, 16, '', {
+    this.chipsPreview = this.add.text(width / 2, btnY - 34, '', {
+      fontSize: '15px', fontFamily: 'monospace', color: '#bdc3c7'
+    }).setOrigin(0.5);
+
+    this.handTypeText = this.add.text(width / 2, btnY - 58, '', {
+      fontSize: '22px', fontFamily: 'monospace', color: '#f1c40f', fontStyle: 'bold'
+    }).setOrigin(0.5);
+
+    this.scoreText = this.add.text(16, 12, '', {
       fontSize: '20px', fontFamily: 'monospace', color: '#ecf0f1'
     });
-    this.targetText = this.add.text(16, 44, `Target: ${TARGET_SCORE}`, {
-      fontSize: '16px', fontFamily: 'monospace', color: '#95a5a6'
+    this.targetText = this.add.text(16, 38, `Target: ${TARGET_SCORE}`, {
+      fontSize: '14px', fontFamily: 'monospace', color: '#95a5a6'
     });
-    this.handsText = this.add.text(width - 16, 16, '', {
+    this.handsText = this.add.text(width - 16, 12, '', {
       fontSize: '20px', fontFamily: 'monospace', color: '#ecf0f1'
     }).setOrigin(1, 0);
-    this.deckText = this.add.text(width - 16, 44, '', {
+    this.deckText = this.add.text(width - 16, 38, '', {
       fontSize: '14px', fontFamily: 'monospace', color: '#7f8c8d'
     }).setOrigin(1, 0);
-
-    this.add.text(width / 2, 80, 'GRAVITY POKER', {
-      fontSize: '14px', fontFamily: 'monospace', color: '#7f8c8d', letterSpacing: 4
-    }).setOrigin(0.5);
 
     this.refreshUI();
   }
@@ -246,8 +253,8 @@ class GameScene extends Phaser.Scene {
 
   cellPos (row, col) {
     return {
-      x: this.gridX + col * (CARD_W + CARD_GAP) + CARD_W / 2,
-      y: this.gridY + row * (CARD_H + CARD_GAP) + CARD_H / 2
+      x: this.gridX + col * (this.cardW + this.cardGap) + this.cardW / 2,
+      y: this.gridY + row * (this.cardH + this.cardGap) + this.cardH / 2
     };
   }
 
@@ -264,37 +271,37 @@ class GameScene extends Phaser.Scene {
   // ---- card factory (individual game objects, no container) ----------
 
   createCardParts (cx, cy, card, row, col) {
+    const cw = this.cardW, ch = this.cardH;
     const bgColor = rankBgColor(card.rank);
-    const bg = this.add.rectangle(cx, cy, CARD_W, CARD_H, bgColor, 1);
+    const bg = this.add.rectangle(cx, cy, cw, ch, bgColor, 1);
     bg.setStrokeStyle(2, 0x34495e);
     bg.baseBg = bgColor;
     bg.setInteractive({ useHandCursor: true });
 
-    // Store mutable grid position on the bg (the interactive element)
     bg.gridRow = row;
     bg.gridCol = col;
     bg.on('pointerdown', () => this.onCardClick(bg.gridRow, bg.gridCol));
 
     const suitColor = SUIT_COLORS[card.suit];
     const hexColor = '#' + suitColor.toString(16).padStart(6, '0');
+    const sf = cw / CARD_W;
 
-    const rankLabel = this.add.text(cx - CARD_W / 2 + 6, cy - CARD_H / 2 + 4, card.rank, {
-      fontSize: '16px', fontFamily: 'monospace', color: hexColor, fontStyle: 'bold'
+    const rankLabel = this.add.text(cx - cw / 2 + 5, cy - ch / 2 + 3, card.rank, {
+      fontSize: Math.max(10, Math.floor(16 * sf)) + 'px', fontFamily: 'monospace', color: hexColor, fontStyle: 'bold'
     });
 
-    const suitLabel = this.add.text(cx, cy + 8, card.suit, {
-      fontSize: '24px', fontFamily: 'monospace', color: hexColor
+    const suitLabel = this.add.text(cx, cy + Math.floor(8 * sf), card.suit, {
+      fontSize: Math.max(14, Math.floor(24 * sf)) + 'px', fontFamily: 'monospace', color: hexColor
     }).setOrigin(0.5);
 
     return { bg, rankLabel, suitLabel };
   }
 
-  // Helpers that operate on all three game objects in a card's parts
-
   setCardPos (parts, cx, cy) {
+    const cw = this.cardW, ch = this.cardH;
     parts.bg.setPosition(cx, cy);
-    parts.rankLabel.setPosition(cx - CARD_W / 2 + 6, cy - CARD_H / 2 + 4);
-    parts.suitLabel.setPosition(cx, cy + 8);
+    parts.rankLabel.setPosition(cx - cw / 2 + 5, cy - ch / 2 + 3);
+    parts.suitLabel.setPosition(cx, cy + Math.floor(8 * (cw / CARD_W)));
   }
 
   destroyCard (parts) {
@@ -507,7 +514,7 @@ class GameScene extends Phaser.Scene {
         if (this.grid[r][c] === null) {
           const card = this.drawCard();
           const dest = this.cellPos(r, c);
-          const startY = this.gridY - (empties - fillIndex) * (CARD_H + CARD_GAP) - CARD_H;
+          const startY = this.gridY - (empties - fillIndex) * (this.cardH + this.cardGap) - this.cardH;
           const parts = this.createCardParts(dest.x, startY, card, r, c);
           this.grid[r][c] = { card, parts };
 
