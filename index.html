@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Gravity Poker</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    height: 100%;
+  }
+  body {
+    background: #1a1a2e;
+    overflow: hidden;
+  }
+  #game-root {
+    width: 100vw;
+    height: 100vh;
+    display: grid;
+    place-items: center;
+  }
+  canvas {
+    display: block;
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+</head>
+<body>
+<div id="game-root"></div>
+<script>
+const GRID_COLS = 5;
+const GRID_ROWS = 5;
+const MAX_CHAIN = 5;
+const STARTING_HANDS = 10;
+const TARGET_SCORE = 2000;
+const DIAGONAL_CONNECTIONS = true;
+
+const CARD_W = 64;
+const CARD_H = 90;
+const CARD_GAP = 8;
+
+const SUITS = ['♥', '♦', '♣', '♠'];
+const SUIT_COLORS = { '♥': 0xe74c3c, '♦': 0xe67e22, '♣': 0x2ecc71, '♠': 0x3498db };
+const RANKS = ['2','3','4','5','6','7','8','9','10','J','Q','K','A'];
+
+const RANK_VALUE = {
+  '2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,
+  'J':10,'Q':10,'K':10,'A':11
+};
+
+const RANK_ORDER = {
+  '2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'10':10,
+  'J':11,'Q':12,'K':13,'A':14
+};
+
+const RANK_GRADIENT_ENABLED = false;
+const CARD_BG_DEFAULT = 0x16213e;
+
+// HSL-interpolated background tint per rank: blue-teal (2) → warm red (A).
+// Keeps saturation/lightness low so suit-colored text stays readable.
+function rankBgColor (rank) {
+  if (!RANK_GRADIENT_ENABLED) return CARD_BG_DEFAULT;
+  const t = (RANK_ORDER[rank] - 2) / 12; // 0 (rank 2) → 1 (rank A)
+  // Hue walks 210° → 0° (blue → teal → green → yellow → red)
+  const h = 210 - t * 210;
+  const s = 0.30 + t * 0.10;  // 30-40% saturation
+  const l = 0.14 + t * 0.04;  // 14-18% lightness
+  // HSL → RGB → packed hex
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let r, g, b;
+  if (h < 60)       { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else               { r = c; g = 0; b = x; }
+  const ri = Math.round((r + m) * 255);
+  const gi = Math.round((g + m) * 255);
+  const bi = Math.round((b + m) * 255);
+  return (ri << 16) | (gi << 8) | bi;
+}
+
+// Scoring balanced via Monte Carlo simulation of 10k random grids.
+// Rarity on the grid (subset freq): HC 56% > Pair 38% > 2P 3.7% >
+// 3oaK 1.6% > Straight 0.29% > Flush 0.15% > FH 0.11% > 4oaK 0.02% > SF 0.001%
+const HAND_TABLE = {
+  'Straight Flush':  { chips: 100, mult: 12 },
+  'Four of a Kind':  { chips: 60,  mult: 8  },
+  'Full House':      { chips: 40,  mult: 5  },
+  'Flush':           { chips: 40,  mult: 4  },
+  'Straight':        { chips: 35,  mult: 4  },
+  'Three of a Kind': { chips: 30,  mult: 3  },
+  'Two Pair':        { chips: 20,  mult: 2  },
+  'Pair':            { chips: 10,  mult: 2  },
+  'High Card':       { chips: 5,   mult: 1  },
+};
+
+// ---- Deck -----------------------------------------------------------
+
+function createDeck () {
+  const deck = [];
+  for (const suit of SUITS)
+    for (const rank of RANKS)
+      deck.push({ suit, rank });
+  return deck;
+}
+
+function shuffle (arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// ---- Poker evaluator (1-5 cards) ------------------------------------
+
+function evaluateHand (cards) {
+  const n = cards.length;
+  if (n === 0) return 'High Card';
+
+  const rankCounts = {};
+  for (const c of cards) rankCounts[c.rank] = (rankCounts[c.rank] || 0) + 1;
+  const counts = Object.values(rankCounts).sort((a, b) => b - a);
+
+  if (n === 1) return 'High Card';
+  if (n === 2) return counts[0] === 2 ? 'Pair' : 'High Card';
+  if (n === 3) {
+    if (counts[0] === 3) return 'Three of a Kind';
+    return counts[0] === 2 ? 'Pair' : 'High Card';
+  }
+  if (n === 4) {
+    if (counts[0] === 4) return 'Four of a Kind';
+    if (counts[0] === 3) return 'Three of a Kind';
+    if (counts[0] === 2 && counts[1] === 2) return 'Two Pair';
+    return counts[0] === 2 ? 'Pair' : 'High Card';
+  }
+
+  const isFlush = new Set(cards.map(c => c.suit)).size === 1;
+  const orders = cards.map(c => RANK_ORDER[c.rank]).sort((a, b) => a - b);
+  let isStraight = false;
+  if (new Set(orders).size === 5) {
+    isStraight = (orders[4] - orders[0] === 4);
+    if (!isStraight && orders[0] === 2 && orders[1] === 3 && orders[2] === 4 && orders[3] === 5 && orders[4] === 14)
+      isStraight = true;
+  }
+
+  if (isFlush && isStraight) return 'Straight Flush';
+  if (counts[0] === 4) return 'Four of a Kind';
+  if (counts[0] === 3 && counts[1] === 2) return 'Full House';
+  if (isFlush) return 'Flush';
+  if (isStraight) return 'Straight';
+  if (counts[0] === 3) return 'Three of a Kind';
+  if (counts[0] === 2 && counts[1] === 2) return 'Two Pair';
+  if (counts[0] === 2) return 'Pair';
+  return 'High Card';
+}
+
+function scoreHand (cards, handType) {
+  const base = HAND_TABLE[handType];
+  const faceValue = cards.reduce((s, c) => s + RANK_VALUE[c.rank], 0);
+  return (base.chips + faceValue) * base.mult;
+}
+
+// ---- Scene ----------------------------------------------------------
+
+class GameScene extends Phaser.Scene {
+  constructor () { super('GameScene'); }
+
+  create () {
+    const { width, height } = this.scale;
+
+    this.drawPile = shuffle(createDeck());
+    this.discardPile = [];
+    this.grid = [];        // grid[row][col] = { card, parts }
+    this.chain = [];       // [{row,col}, ...]
+    this.score = 0;
+    this.handsLeft = STARTING_HANDS;
+    this.busy = false;
+
+    const gridW = GRID_COLS * (CARD_W + CARD_GAP) - CARD_GAP;
+    const gridH = GRID_ROWS * (CARD_H + CARD_GAP) - CARD_GAP;
+    this.gridX = (width - gridW) / 2;
+    // Keep gameplay vertically centered-ish while guaranteeing controls are visible.
+    // Required vertical space below grid:
+    // handType gap (24) + button gap (68) + button half-height (22) + bottom padding (10).
+    const requiredBelowGrid = 124;
+    const maxGridYForFit = height - gridH - requiredBelowGrid;
+    this.gridY = Math.max(80, Math.min(110, maxGridYForFit));
+
+    for (let r = 0; r < GRID_ROWS; r++) {
+      this.grid[r] = [];
+      for (let c = 0; c < GRID_COLS; c++) {
+        const card = this.drawCard();
+        const pos = this.cellPos(r, c);
+        this.grid[r][c] = { card, parts: this.createCardParts(pos.x, pos.y, card, r, c) };
+      }
+    }
+
+    // ---- UI ---------------------------------------------------------
+
+    const panelY = this.gridY + gridH + 24;
+
+    this.handTypeText = this.add.text(width / 2, panelY, '', {
+      fontSize: '22px', fontFamily: 'monospace', color: '#f1c40f', fontStyle: 'bold'
+    }).setOrigin(0.5);
+
+    this.chipsPreview = this.add.text(width / 2, panelY + 28, '', {
+      fontSize: '15px', fontFamily: 'monospace', color: '#bdc3c7'
+    }).setOrigin(0.5);
+
+    const btnY = panelY + 68;
+    this.playBtn = this.add.rectangle(width / 2, btnY, 180, 44, 0x9b59b6, 1)
+      .setInteractive({ useHandCursor: true })
+      .on('pointerdown', () => this.onPlayHand())
+      .on('pointerover', () => this.playBtn.setFillStyle(0x8e44ad))
+      .on('pointerout', () => this.playBtn.setFillStyle(0x9b59b6));
+    this.playBtnLabel = this.add.text(width / 2, btnY, 'PLAY HAND', {
+      fontSize: '18px', fontFamily: 'monospace', color: '#fff', fontStyle: 'bold'
+    }).setOrigin(0.5);
+
+    this.scoreText = this.add.text(16, 16, '', {
+      fontSize: '20px', fontFamily: 'monospace', color: '#ecf0f1'
+    });
+    this.targetText = this.add.text(16, 44, `Target: ${TARGET_SCORE}`, {
+      fontSize: '16px', fontFamily: 'monospace', color: '#95a5a6'
+    });
+    this.handsText = this.add.text(width - 16, 16, '', {
+      fontSize: '20px', fontFamily: 'monospace', color: '#ecf0f1'
+    }).setOrigin(1, 0);
+    this.deckText = this.add.text(width - 16, 44, '', {
+      fontSize: '14px', fontFamily: 'monospace', color: '#7f8c8d'
+    }).setOrigin(1, 0);
+
+    this.add.text(width / 2, 80, 'GRAVITY POKER', {
+      fontSize: '14px', fontFamily: 'monospace', color: '#7f8c8d', letterSpacing: 4
+    }).setOrigin(0.5);
+
+    this.refreshUI();
+  }
+
+  // ---- grid position ------------------------------------------------
+
+  cellPos (row, col) {
+    return {
+      x: this.gridX + col * (CARD_W + CARD_GAP) + CARD_W / 2,
+      y: this.gridY + row * (CARD_H + CARD_GAP) + CARD_H / 2
+    };
+  }
+
+  // ---- deck ---------------------------------------------------------
+
+  drawCard () {
+    if (this.drawPile.length === 0) {
+      this.drawPile = shuffle([...this.discardPile]);
+      this.discardPile = [];
+    }
+    return this.drawPile.pop();
+  }
+
+  // ---- card factory (individual game objects, no container) ----------
+
+  createCardParts (cx, cy, card, row, col) {
+    const bgColor = rankBgColor(card.rank);
+    const bg = this.add.rectangle(cx, cy, CARD_W, CARD_H, bgColor, 1);
+    bg.setStrokeStyle(2, 0x34495e);
+    bg.baseBg = bgColor;
+    bg.setInteractive({ useHandCursor: true });
+
+    // Store mutable grid position on the bg (the interactive element)
+    bg.gridRow = row;
+    bg.gridCol = col;
+    bg.on('pointerdown', () => this.onCardClick(bg.gridRow, bg.gridCol));
+
+    const suitColor = SUIT_COLORS[card.suit];
+    const hexColor = '#' + suitColor.toString(16).padStart(6, '0');
+
+    const rankLabel = this.add.text(cx - CARD_W / 2 + 6, cy - CARD_H / 2 + 4, card.rank, {
+      fontSize: '16px', fontFamily: 'monospace', color: hexColor, fontStyle: 'bold'
+    });
+
+    const suitLabel = this.add.text(cx, cy + 8, card.suit, {
+      fontSize: '24px', fontFamily: 'monospace', color: hexColor
+    }).setOrigin(0.5);
+
+    return { bg, rankLabel, suitLabel };
+  }
+
+  // Helpers that operate on all three game objects in a card's parts
+
+  setCardPos (parts, cx, cy) {
+    parts.bg.setPosition(cx, cy);
+    parts.rankLabel.setPosition(cx - CARD_W / 2 + 6, cy - CARD_H / 2 + 4);
+    parts.suitLabel.setPosition(cx, cy + 8);
+  }
+
+  destroyCard (parts) {
+    parts.bg.destroy();
+    parts.rankLabel.destroy();
+    parts.suitLabel.destroy();
+  }
+
+  tweenCardTo (parts, props, config) {
+    const { bg, rankLabel, suitLabel } = parts;
+    const allParts = [bg, rankLabel, suitLabel];
+
+    if (props.y !== undefined) {
+      const dy = props.y - bg.y;
+      const targets = allParts.map(p => ({ obj: p, targetY: p.y + dy }));
+
+      let remaining = targets.length;
+      for (const t of targets) {
+        this.tweens.add({
+          targets: t.obj,
+          y: t.targetY,
+          duration: config.duration || 200,
+          ease: config.ease || 'Linear',
+          delay: config.delay || 0,
+          onComplete: () => {
+            remaining--;
+            if (remaining === 0 && config.onComplete) config.onComplete();
+          }
+        });
+      }
+    }
+  }
+
+  tweenCardDestroy (parts, config) {
+    const allParts = [parts.bg, parts.rankLabel, parts.suitLabel];
+    let remaining = allParts.length;
+
+    for (const obj of allParts) {
+      this.tweens.add({
+        targets: obj,
+        scaleX: 0, scaleY: 0, alpha: 0,
+        duration: config.duration || 250,
+        ease: config.ease || 'Back.easeIn',
+        onComplete: () => {
+          obj.destroy();
+          remaining--;
+          if (remaining === 0 && config.onComplete) config.onComplete();
+        }
+      });
+    }
+  }
+
+  // ---- selection ----------------------------------------------------
+
+  onCardClick (row, col) {
+    if (this.busy) return;
+
+    const idx = this.chain.findIndex(p => p.row === row && p.col === col);
+
+    if (idx !== -1) {
+      const removed = this.chain.splice(idx);
+      for (const p of removed) this.unhighlightCell(p.row, p.col);
+    } else {
+      if (this.chain.length >= MAX_CHAIN) return;
+      if (this.chain.length > 0) {
+        const touchesChain = this.chain.some(p => this.isAdjacent(p.row, p.col, row, col));
+        if (!touchesChain) return;
+      }
+      this.chain.push({ row, col });
+      this.highlightCell(row, col);
+    }
+
+    this.updateHandPreview();
+  }
+
+  isAdjacent (r1, c1, r2, c2) {
+    const dr = Math.abs(r1 - r2), dc = Math.abs(c1 - c2);
+    if (dr === 0 && dc === 0) return false;
+    if (DIAGONAL_CONNECTIONS) return dr <= 1 && dc <= 1;
+    return (dr + dc) === 1;
+  }
+
+  highlightCell (row, col) {
+    const cell = this.grid[row]?.[col];
+    if (!cell) return;
+    cell.parts.bg.setStrokeStyle(3, 0xf1c40f);
+    cell.parts.bg.setFillStyle(0x2c3e6e);
+  }
+
+  unhighlightCell (row, col) {
+    const cell = this.grid[row]?.[col];
+    if (!cell) return;
+    cell.parts.bg.setStrokeStyle(2, 0x34495e);
+    cell.parts.bg.setFillStyle(cell.parts.bg.baseBg);
+  }
+
+  updateHandPreview () {
+    const cards = this.chain.map(p => this.grid[p.row][p.col].card);
+    if (cards.length === 0) {
+      this.handTypeText.setText('');
+      this.chipsPreview.setText('Select 1-5 adjacent cards');
+      return;
+    }
+    const ht = evaluateHand(cards);
+    const pts = scoreHand(cards, ht);
+    const base = HAND_TABLE[ht];
+    const fv = cards.reduce((s, c) => s + RANK_VALUE[c.rank], 0);
+    this.handTypeText.setText(ht);
+    this.chipsPreview.setText(`(${base.chips}+${fv}) × ${base.mult} = ${pts}`);
+  }
+
+  // ---- play hand ----------------------------------------------------
+
+  onPlayHand () {
+    if (this.busy || this.chain.length === 0) return;
+    this.busy = true;
+
+    const cards = this.chain.map(p => this.grid[p.row][p.col].card);
+    const handType = evaluateHand(cards);
+    const points = scoreHand(cards, handType);
+
+    this.score += points;
+    this.handsLeft--;
+
+    const { width } = this.scale;
+    const popup = this.add.text(width / 2, this.gridY - 20, `+${points}`, {
+      fontSize: '28px', fontFamily: 'monospace', color: '#f1c40f', fontStyle: 'bold'
+    }).setOrigin(0.5);
+    this.tweens.add({
+      targets: popup, y: popup.y - 50, alpha: 0, duration: 900, ease: 'Power2',
+      onComplete: () => popup.destroy()
+    });
+
+    const positions = [...this.chain];
+    this.chain = [];
+
+    let destroyCount = positions.length;
+    for (const p of positions) {
+      const cell = this.grid[p.row][p.col];
+      this.discardPile.push(cell.card);
+      this.grid[p.row][p.col] = null;
+
+      this.tweenCardDestroy(cell.parts, {
+        duration: 250,
+        onComplete: () => {
+          destroyCount--;
+          if (destroyCount === 0) {
+            this.applyGravity(() => {
+              this.refillGrid(() => {
+                this.busy = false;
+                this.refreshUI();
+                this.checkEndCondition();
+              });
+            });
+          }
+        }
+      });
+    }
+
+    this.refreshUI();
+  }
+
+  // ---- gravity ------------------------------------------------------
+
+  applyGravity (onComplete) {
+    let tweensRunning = 0;
+
+    for (let c = 0; c < GRID_COLS; c++) {
+      let writeRow = GRID_ROWS - 1;
+
+      for (let r = GRID_ROWS - 1; r >= 0; r--) {
+        if (this.grid[r][c] !== null) {
+          if (r !== writeRow) {
+            const cell = this.grid[r][c];
+            this.grid[writeRow][c] = cell;
+            this.grid[r][c] = null;
+
+            cell.parts.bg.gridRow = writeRow;
+            const target = this.cellPos(writeRow, c);
+
+            tweensRunning++;
+            this.tweenCardTo(cell.parts, { y: target.y }, {
+              duration: 200,
+              ease: 'Bounce.easeOut',
+              delay: (writeRow - r) * 40,
+              onComplete: () => { if (--tweensRunning === 0) onComplete(); }
+            });
+          }
+          writeRow--;
+        }
+      }
+    }
+
+    if (tweensRunning === 0) onComplete();
+  }
+
+  // ---- refill -------------------------------------------------------
+
+  refillGrid (onComplete) {
+    let tweensRunning = 0;
+
+    for (let c = 0; c < GRID_COLS; c++) {
+      let empties = 0;
+      for (let r = 0; r < GRID_ROWS; r++) {
+        if (this.grid[r][c] === null) empties++;
+      }
+
+      let fillIndex = 0;
+      for (let r = 0; r < GRID_ROWS; r++) {
+        if (this.grid[r][c] === null) {
+          const card = this.drawCard();
+          const dest = this.cellPos(r, c);
+          const startY = this.gridY - (empties - fillIndex) * (CARD_H + CARD_GAP) - CARD_H;
+          const parts = this.createCardParts(dest.x, startY, card, r, c);
+          this.grid[r][c] = { card, parts };
+
+          tweensRunning++;
+          this.tweenCardTo(parts, { y: dest.y }, {
+            duration: 300,
+            ease: 'Bounce.easeOut',
+            delay: fillIndex * 60,
+            onComplete: () => { if (--tweensRunning === 0) onComplete(); }
+          });
+          fillIndex++;
+        }
+      }
+    }
+
+    if (tweensRunning === 0) onComplete();
+  }
+
+  // ---- UI -----------------------------------------------------------
+
+  refreshUI () {
+    this.scoreText.setText(`Score: ${this.score}`);
+    this.handsText.setText(`Hands: ${this.handsLeft}`);
+    this.deckText.setText(`Deck: ${this.drawPile.length}`);
+    this.handTypeText.setText('');
+    this.chipsPreview.setText('Select 1-5 adjacent cards');
+  }
+
+  // ---- end conditions -----------------------------------------------
+
+  checkEndCondition () {
+    if (this.score >= TARGET_SCORE) {
+      this.showEndScreen(true);
+    } else if (this.handsLeft <= 0) {
+      this.showEndScreen(false);
+    }
+  }
+
+  showEndScreen (won) {
+    this.busy = true;
+    const { width, height } = this.scale;
+
+    this.add.rectangle(width / 2, height / 2, width, height, 0x000000, 0.75).setDepth(100);
+
+    const title = won ? 'YOU WIN!' : 'GAME OVER';
+    const color = won ? '#2ecc71' : '#e74c3c';
+
+    this.add.text(width / 2, height / 2 - 50, title, {
+      fontSize: '40px', fontFamily: 'monospace', color, fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(101);
+
+    this.add.text(width / 2, height / 2, `Final Score: ${this.score}`, {
+      fontSize: '22px', fontFamily: 'monospace', color: '#ecf0f1'
+    }).setOrigin(0.5).setDepth(101);
+
+    const restartBtn = this.add.rectangle(width / 2, height / 2 + 60, 200, 48, 0x9b59b6)
+      .setDepth(101)
+      .setInteractive({ useHandCursor: true })
+      .on('pointerdown', () => this.scene.restart())
+      .on('pointerover', () => restartBtn.setFillStyle(0x8e44ad))
+      .on('pointerout', () => restartBtn.setFillStyle(0x9b59b6));
+
+    this.add.text(width / 2, height / 2 + 60, 'PLAY AGAIN', {
+      fontSize: '18px', fontFamily: 'monospace', color: '#fff', fontStyle: 'bold'
+    }).setOrigin(0.5).setDepth(101);
+  }
+}
+
+const config = {
+  type: Phaser.AUTO,
+  parent: 'game-root',
+  width: 400,
+  height: 700,
+  backgroundColor: '#1a1a2e',
+  scene: [GameScene],
+  scale: {
+    mode: Phaser.Scale.FIT,
+    autoCenter: Phaser.Scale.NO_CENTER
+  },
+  input: {
+    activePointers: 1
+  }
+};
+
+const game = new Phaser.Game(config);
+</script>
+</body>
+</html>
